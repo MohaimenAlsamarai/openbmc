@@ -1,0 +1,506 @@
+From 120a42f97df1db397b5ac73a3c371a636a91d09b Mon Sep 17 00:00:00 2001
+From: Mohaimen <mohaimen.alsamarai@foxconn.com>
+Date: Thu, 19 Nov 2020 15:57:08 -0600
+Subject: [PATCH 8/8] drivers char ipmi Add Support NPCM7xx BMC SSIF driver
+
+It supports Fii-kudo board that uses Ampere Altra & Nuvoton BMC.
+Add chip detection to switch between assped and npcm7xx for slave enable disable function
+
+signed off by: Mohaimen Alsamarai <Mohaimen.Alsamarai@fii-na.com>
+---
+ drivers/char/ipmi/ssif-bmc.c | 329 +++++++++++++++++++++++++++++++----
+ 1 file changed, 297 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/char/ipmi/ssif-bmc.c b/drivers/char/ipmi/ssif-bmc.c
+index c6e836b645ca..9ed25f9fdb5c 100644
+--- a/drivers/char/ipmi/ssif-bmc.c
++++ b/drivers/char/ipmi/ssif-bmc.c
+@@ -40,14 +40,23 @@
+ #include <linux/uaccess.h>
+ #include <linux/wait.h>
+ 
+-#define PFX		"IPMI SSIF BMC : "
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/iopoll.h>
++#include <linux/irq.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/mfd/syscon.h>
++
++#define PFX "IPMI SSIF BMC : "
+ 
+ #define DEVICE_NAME	"ipmi-ssif-host"
+ 
+-#define MSG_PAYLOAD_LEN_MAX			252
++#define MSG_PAYLOAD_LEN_MAX	252
+ 
+ /* A standard SMBus Transaction is limited to 32 data bytes */
+-#define MAX_PAYLOAD_PER_TRANSACTION		32
++#define MAX_PAYLOAD_PER_TRANSACTION	32
+ 
+ #define MAX_IPMI_DATA_PER_START_TRANSACTION	30
+ #define MAX_IPMI_DATA_PER_MIDDLE_TRANSACTION	31
+@@ -146,18 +155,18 @@ struct ssif_bmc {
+ #define ASPEED_I2CD_INTR_RX_DONE			BIT(2)
+ #define ASPEED_I2CD_INTR_TX_NAK				BIT(1)
+ #define ASPEED_I2CD_INTR_TX_ACK				BIT(0)
+-#define ASPEED_I2CD_INTR_ALL						       \
+-		(ASPEED_I2CD_INTR_SDA_DL_TIMEOUT |			       \
+-		 ASPEED_I2CD_INTR_BUS_RECOVER_DONE |			       \
+-		 ASPEED_I2CD_INTR_SCL_TIMEOUT |				       \
+-		 ASPEED_I2CD_INTR_ABNORMAL |				       \
+-		 ASPEED_I2CD_INTR_NORMAL_STOP |				       \
+-		 ASPEED_I2CD_INTR_ARBIT_LOSS |				       \
+-		 ASPEED_I2CD_INTR_RX_DONE |				       \
+-		 ASPEED_I2CD_INTR_TX_NAK |				       \
++#define ASPEED_I2CD_INTR_ALL						\
++		(ASPEED_I2CD_INTR_SDA_DL_TIMEOUT |			\
++		 ASPEED_I2CD_INTR_BUS_RECOVER_DONE |			\
++		 ASPEED_I2CD_INTR_SCL_TIMEOUT |				\
++		 ASPEED_I2CD_INTR_ABNORMAL |				\
++		 ASPEED_I2CD_INTR_NORMAL_STOP |				\
++		 ASPEED_I2CD_INTR_ARBIT_LOSS |				\
++		 ASPEED_I2CD_INTR_RX_DONE |				\
++		 ASPEED_I2CD_INTR_TX_NAK |				\
+ 		 ASPEED_I2CD_INTR_TX_ACK)
+ 
+-/* 0x14 : I2CD Command/Status Register   */
++/* 0x14 : I2CD Command/Status Register	*/
+ #define ASPEED_I2CD_SCL_LINE_STS			BIT(18)
+ #define ASPEED_I2CD_SDA_LINE_STS			BIT(17)
+ #define ASPEED_I2CD_BUS_BUSY_STS			BIT(16)
+@@ -171,7 +180,7 @@ struct ssif_bmc {
+ #define ASPEED_I2CD_M_TX_CMD				BIT(1)
+ #define ASPEED_I2CD_M_START_CMD				BIT(0)
+ 
+-/* 0x18 : I2CD Slave Device Address Register   */
++/* 0x18 : I2CD Slave Device Address Register	*/
+ #define ASPEED_I2CD_DEV_ADDR_MASK			GENMASK(6, 0)
+ 
+ enum aspeed_i2c_master_state {
+@@ -193,6 +202,122 @@ enum aspeed_i2c_slave_state {
+ 	ASPEED_I2C_SLAVE_WRITE_RECEIVED,
+ };
+ 
++/* Common regs */
++#define NPCM_I2CSDA			0x00
++#define NPCM_I2CST			0x02
++#define NPCM_I2CCST			0x04
++#define NPCM_I2CCTL1			0x06
++#define NPCM_I2CADDR1			0x08
++#define NPCM_I2CCTL2			0x0A
++#define NPCM_I2CADDR2			0x0C
++#define NPCM_I2CCTL3			0x0E
++#define NPCM_I2CCST2			0x18
++#define NPCM_I2CCST3			0x19
++#define I2C_VER				0x1F
++
++/* NPCM_I2CCTL3 reg fields */
++#define NPCM_I2CCTL3_SCLFRQ8_7		GENMASK(1, 0)
++#define NPCM_I2CCTL3_ARPMEN		BIT(2)
++#define NPCM_I2CCTL3_IDL_START		BIT(3)
++#define NPCM_I2CCTL3_400K_MODE		BIT(4)
++#define NPCM_I2CCTL3_BNK_SEL		BIT(5)
++#define NPCM_I2CCTL3_SDA_LVL		BIT(6)
++#define NPCM_I2CCTL3_SCL_LVL		BIT(7)
++
++/* NPCM_I2CCTL1 reg fields */
++#define NPCM_I2CCTL1_START		BIT(0)
++#define NPCM_I2CCTL1_STOP		BIT(1)
++#define NPCM_I2CCTL1_INTEN		BIT(2)
++#define NPCM_I2CCTL1_EOBINTE		BIT(3)
++#define NPCM_I2CCTL1_ACK		BIT(4)
++#define NPCM_I2CCTL1_GCMEN		BIT(5)
++#define NPCM_I2CCTL1_NMINTE		BIT(6)
++#define NPCM_I2CCTL1_STASTRE		BIT(7)
++
++#define I2C_HW_FIFO_SIZE		16
++
++#define NPCM_I2CADDR_SAEN		BIT(7)
++
++/* RW1S fields (inside a RW reg): */
++#define NPCM_I2CCTL1_RWS   \
++	(NPCM_I2CCTL1_START | NPCM_I2CCTL1_STOP | NPCM_I2CCTL1_ACK)
++
++#if IS_ENABLED(CONFIG_I2C_SLAVE)
++/*
++ * npcm_i2caddr array:
++ * The module supports having multiple own slave addresses.
++ * Since the addr regs are sprinkled all over the address space,
++ * use this array to get the address or each register.
++ */
++#define I2C_NUM_OWN_ADDR 10
++static const int npcm_i2caddr[I2C_NUM_OWN_ADDR] = {
++	NPCM_I2CADDR1, 
++};
++#endif
++
++/* I2C Bank (module had 2 banks of registers) */
++enum i2c_bank {
++	I2C_BANK_0 = 0,
++	I2C_BANK_1,
++};
++
++/* Module supports setting multiple own slave addresses */
++enum i2c_addr {
++	I2C_SLAVE_ADDR1 = 0,
++	I2C_SLAVE_ADDR2,
++	I2C_SLAVE_ADDR3,
++	I2C_SLAVE_ADDR4,
++	I2C_SLAVE_ADDR5,
++	I2C_SLAVE_ADDR6,
++	I2C_SLAVE_ADDR7,
++	I2C_SLAVE_ADDR8,
++	I2C_SLAVE_ADDR9,
++	I2C_SLAVE_ADDR10,
++	I2C_GC_ADDR,
++	I2C_ARP_ADDR,
++};
++
++enum i2c_mode {
++	I2C_MASTER,
++	I2C_SLAVE,
++};
++
++enum i2c_state_ind {
++	I2C_NO_STATUS_IND = 0,
++	I2C_SLAVE_RCV_IND,
++	I2C_SLAVE_XMIT_IND,
++	I2C_SLAVE_XMIT_MISSING_DATA_IND,
++	I2C_SLAVE_RESTART_IND,
++	I2C_SLAVE_DONE_IND,
++	I2C_MASTER_DONE_IND,
++	I2C_NACK_IND,
++	I2C_BUS_ERR_IND,
++	I2C_WAKE_UP_IND,
++	I2C_BLOCK_BYTES_ERR_IND,
++	I2C_SLAVE_RCV_MISSING_DATA_IND,
++};
++
++/* Internal I2C states values (for the I2C module state machine). */
++enum i2c_state {
++	I2C_DISABLE = 0,
++	I2C_IDLE,
++	I2C_MASTER_START,
++	I2C_SLAVE_MATCH,
++	I2C_OPER_STARTED,
++	I2C_STOP_PENDING,
++};
++
++/*
++ * Operation type values (used to define the operation currently running)
++ * module is interrupt driven, on each interrupt the current operation is
++ * checked to see if the module is currently reading or writing.
++ */
++enum i2c_oper {
++	I2C_NO_OPER = 0,
++	I2C_WRITE_OPER,
++	I2C_READ_OPER,
++};
++
+ struct aspeed_i2c_bus {
+ 	struct i2c_adapter		adap;
+ 	struct device			*dev;
+@@ -221,13 +346,63 @@ struct aspeed_i2c_bus {
+ #endif /* CONFIG_I2C_SLAVE */
+ };
+ 
+-void aspeed_i2c_disable_interrupt(struct aspeed_i2c_bus *bus,
++/* Status of one I2C module */
++struct npcm_i2c {
++	struct i2c_adapter		adap;
++	struct device			*dev;
++	unsigned char __iomem		*reg;
++	spinlock_t lock;  /* IRQ synchronization */
++	struct completion		cmd_complete;
++	int				cmd_err;
++	struct i2c_msg			*msgs;
++	int				msgs_num;
++	int				num;
++	u32				apb_clk;
++	struct i2c_bus_recovery_info	rinfo;
++	enum i2c_state			state;
++	enum i2c_oper			operation;
++	enum i2c_mode			master_or_slave;
++	enum i2c_state_ind		stop_ind;
++	u8				dest_addr;
++	u8				*rd_buf;
++	u16				rd_size;
++	u16				rd_ind;
++	u8				*wr_buf;
++	u16				wr_size;
++	u16				wr_ind;
++	bool				fifo_use;
++	u16				PEC_mask; /* PEC bit mask per slave address */
++	bool				PEC_use;
++	bool				read_block_use;
++	unsigned long			int_time_stamp;
++	unsigned long			bus_freq; /* in Hz */
++#if IS_ENABLED(CONFIG_I2C_SLAVE)
++	u8				own_slave_addr;
++	struct i2c_client		*slave;
++	int				slv_rd_size;
++	int				slv_rd_ind;
++	int				slv_wr_size;
++	int				slv_wr_ind;
++	u8				slv_rd_buf[I2C_HW_FIFO_SIZE];
++	u8				slv_wr_buf[I2C_HW_FIFO_SIZE];
++#endif
++	struct dentry			*debugfs; /* debugfs device directory */
++	u64				ber_cnt;
++	u64				rec_succ_cnt;
++	u64				rec_fail_cnt;
++	u64				nack_cnt;
++	u64				timeout_cnt;
++};
++
++void aspeed_i2c_disable_interrupt (struct aspeed_i2c_bus *bus,
+ 		unsigned long mask)
+ {
+ 	unsigned long current_mask;
+ 
+ 	current_mask = readl(bus->base + ASPEED_I2C_INTR_CTRL_REG);
+ 	writel(current_mask & ~mask, bus->base + ASPEED_I2C_INTR_CTRL_REG);
++
++	return;
+ }
+ 
+ void aspeed_i2c_disable_slave(struct aspeed_i2c_bus *bus)
+@@ -240,15 +415,19 @@ void aspeed_i2c_disable_slave(struct aspeed_i2c_bus *bus)
+ 	aspeed_i2c_disable_interrupt(bus, ASPEED_I2CD_INTR_SLAVE_MATCH);
+ 
+ 	spin_unlock_irqrestore(&bus->lock, flags);
++
++	return;
+ }
+ 
+-void aspeed_i2c_enable_interrupt(struct aspeed_i2c_bus *bus,
++void aspeed_i2c_enable_interrupt (struct aspeed_i2c_bus *bus,
+ 		unsigned long mask)
+ {
+ 	unsigned long current_mask;
+ 
+ 	current_mask = readl(bus->base + ASPEED_I2C_INTR_CTRL_REG);
+ 	writel(current_mask | mask, bus->base + ASPEED_I2C_INTR_CTRL_REG);
++
++	return;
+ }
+ 
+ void aspeed_i2c_enable_slave(struct aspeed_i2c_bus *bus)
+@@ -261,6 +440,81 @@ void aspeed_i2c_enable_slave(struct aspeed_i2c_bus *bus)
+ 	aspeed_i2c_enable_interrupt(bus, ASPEED_I2CD_INTR_SLAVE_MATCH);
+ 
+ 	spin_unlock_irqrestore(&bus->lock, flags);
++
++	return;
++}
++
++
++static inline void npcm_i2c_select_bank(struct npcm_i2c *bus,
++					enum i2c_bank bank)
++{
++	u8 i2cctl3 = ioread8(bus->reg + NPCM_I2CCTL3);
++
++	if (bank == I2C_BANK_0)
++		i2cctl3 = i2cctl3 & ~NPCM_I2CCTL3_BNK_SEL;
++	else
++		i2cctl3 = i2cctl3 | NPCM_I2CCTL3_BNK_SEL;
++	iowrite8(i2cctl3, bus->reg + NPCM_I2CCTL3);
++}
++
++static void npcm_i2c_slave_int_enable(struct npcm_i2c *bus, bool enable)
++{
++	u8 i2cctl1;
++
++	/* enable interrupt on slave match: */
++	i2cctl1 = ioread8(bus->reg + NPCM_I2CCTL1);
++	i2cctl1 &= ~NPCM_I2CCTL1_RWS;
++	if (enable)
++		i2cctl1 |= NPCM_I2CCTL1_NMINTE;
++	else
++		i2cctl1 &= ~NPCM_I2CCTL1_NMINTE;
++	iowrite8(i2cctl1, bus->reg + NPCM_I2CCTL1);
++}
++
++static int npcm_i2c_slave_enable(struct npcm_i2c *bus, enum i2c_addr addr_type,
++				 u8 addr, bool enable)
++{
++	unsigned long flags;
++	u8 i2cctl1;
++	u8 i2cctl3;
++	u8 sa_reg;
++	spin_lock_irqsave(&bus->lock, flags);
++	sa_reg = (addr & 0x7F) | FIELD_PREP(NPCM_I2CADDR_SAEN, enable);
++	if (addr_type == I2C_GC_ADDR) {
++		i2cctl1 = ioread8(bus->reg + NPCM_I2CCTL1);
++		if (enable)
++			i2cctl1 |= NPCM_I2CCTL1_GCMEN;
++		else
++	{
++			i2cctl1 &= ~NPCM_I2CCTL1_GCMEN;
++		spin_unlock_irqrestore(&bus->lock, flags);
++	}
++		iowrite8(i2cctl1, bus->reg + NPCM_I2CCTL1);
++		return 0;
++	}
++	if (addr_type == I2C_ARP_ADDR) {
++		i2cctl3 = ioread8(bus->reg + NPCM_I2CCTL3);
++		if (enable)
++			i2cctl3 |= NPCM_I2CCTL3_ARPMEN;
++		else
++	{
++			i2cctl3 &= ~NPCM_I2CCTL3_ARPMEN;
++		spin_unlock_irqrestore(&bus->lock, flags);
++	}
++		iowrite8(i2cctl3, bus->reg + NPCM_I2CCTL3);
++		return 0;
++	}
++	if (addr_type >= I2C_ARP_ADDR)
++		return -EFAULT;
++	/* select bank 0 for address 3 to 10 */
++	if (addr_type > I2C_SLAVE_ADDR2)
++		npcm_i2c_select_bank(bus, I2C_BANK_0);
++	/* Set and enable the address */
++	iowrite8(sa_reg, bus->reg + npcm_i2caddr[addr_type]);
++	npcm_i2c_slave_int_enable(bus, enable);
++	if (addr_type > I2C_SLAVE_ADDR2)
++		npcm_i2c_select_bank(bus, I2C_BANK_1);
++	return 0;
+ }
+ 
+ /*
+@@ -375,6 +629,8 @@ static ssize_t ssif_bmc_write(struct file *file, const char __user *buf, size_t
+ 	struct ssif_bmc *ssif_bmc = to_ssif_bmc(file);
+ 	struct ssif_msg msg;
+ 	ssize_t ret;
++	struct i2c_client *client;
++	struct npcm_i2c *bus = i2c_get_adapdata(client->adapter);
+ 
+ 	if (count > sizeof(msg))
+ 		return -EINVAL;
+@@ -393,8 +649,11 @@ static ssize_t ssif_bmc_write(struct file *file, const char __user *buf, size_t
+ 	 * When user application is done with the response, master can
+ 	 * start to get the response after this.
+ 	 */
+-	aspeed_i2c_enable_slave(ssif_bmc->i2c_bus);
+-
++	if (IS_ENABLED(CONFIG_ARCH_NPCM7XX))
++		npcm_i2c_slave_enable(bus, I2C_SLAVE_ADDR1, client->addr, true);
++	else
++		aspeed_i2c_enable_slave(ssif_bmc->i2c_bus);
++	
+ 	return count;
+ }
+ 
+@@ -436,9 +695,16 @@ static int handle_request(struct ssif_bmc *ssif_bmc)
+ 	/* FIXME: Disable I2C Slave to prevent incoming interrupts
+ 	 * It should be called as soon as possible right after the request
+ 	 * is received.
+-	 */
+-	aspeed_i2c_disable_slave(ssif_bmc->i2c_bus);
++	 */  
++	struct i2c_client *client;
++	struct npcm_i2c *bus = i2c_get_adapdata(client->adapter);
+ 
++	if (IS_ENABLED(CONFIG_ARCH_NPCM7XX))
++		npcm_i2c_slave_enable(bus, I2C_SLAVE_ADDR1, client->addr, false);
++	else
++		aspeed_i2c_disable_slave(ssif_bmc->i2c_bus);
++	
++	
+ 	/* Data request is available to process */
+ 	ssif_bmc->request_available = true;
+ 	/* This is the new READ request.
+@@ -466,7 +732,7 @@ static void set_response_buffer(struct ssif_bmc *ssif_bmc)
+ {
+ 	u8 response_data_len = 0;
+ 
+-	switch (ssif_bmc->smbus_cmd) {
++	switch(ssif_bmc->smbus_cmd) {
+ 	case SSIF_IPMI_RESPONSE:
+ 		/* IPMI READ Start can carry up to 30 bytes IPMI Data
+ 		 * and Start Flag 0x00 0x01.
+@@ -483,7 +749,6 @@ static void set_response_buffer(struct ssif_bmc *ssif_bmc)
+ 				ssif_bmc->response.payload + 1,
+ 				response_data_len);
+ 
+-
+ 		break;
+ 	case SSIF_IPMI_MULTI_PART_RESPONSE_MIDDLE:
+ 		/* IPMI READ Middle or Read End can carry up to 31 bytes IPMI
+@@ -543,7 +808,7 @@ static void event_request_read(struct ssif_bmc *ssif_bmc, u8 *val)
+ 	}
+ 
+ 	/* Multi-part processing */
+-	switch (ssif_bmc->smbus_cmd) {
++	switch(ssif_bmc->smbus_cmd) {
+ 	case SSIF_IPMI_RESPONSE:
+ 		/* Read Start length is 32 bytes
+ 		 * Read Start transfer first 30 bytes of IPMI response
+@@ -631,6 +896,7 @@ static void event_process_read(struct ssif_bmc *ssif_bmc, u8 *val)
+ 			complete_response(ssif_bmc);
+ 		}
+ 	}
++
+ }
+ 
+ /*
+@@ -645,11 +911,11 @@ static int ssif_bmc_cb(struct i2c_client *client,
+ 	spin_lock(&ssif_bmc->lock);
+ 
+ 	/* I2C Event Handler:
+-	 *   I2C_SLAVE_READ_REQUESTED	0x0
+-	 *   I2C_SLAVE_WRITE_REQUESTED	0x1
+-	 *   I2C_SLAVE_READ_PROCESSED	0x2
+-	 *   I2C_SLAVE_WRITE_RECEIVED	0x3
+-	 *   I2C_SLAVE_STOP		0x4
++	 *	I2C_SLAVE_READ_REQUESTED 	0x0
++	 * 	I2C_SLAVE_WRITE_REQUESTED 	0x1
++	 * 	I2C_SLAVE_READ_PROCESSED	0x2
++	 * 	I2C_SLAVE_WRITE_RECEIVED	0x3
++	 * 	I2C_SLAVE_STOP			0x4
+ 	 */
+ 	switch (event) {
+ 	case I2C_SLAVE_READ_REQUESTED:
+@@ -707,7 +973,7 @@ static int ssif_bmc_cb(struct i2c_client *client,
+ }
+ 
+ static int ssif_bmc_probe(struct i2c_client *client,
+-			const struct i2c_device_id *id)
++			        const struct i2c_device_id *id)
+ {
+ 	struct ssif_bmc *ssif_bmc;
+ 	int ret;
+@@ -715,7 +981,7 @@ static int ssif_bmc_probe(struct i2c_client *client,
+ 	ssif_bmc = devm_kzalloc(&client->dev, sizeof(*ssif_bmc), GFP_KERNEL);
+ 	if (!ssif_bmc)
+ 		return -ENOMEM;
+-
++		
+ 	spin_lock_init(&ssif_bmc->lock);
+ 
+ 	init_waitqueue_head(&ssif_bmc->wait_queue);
+@@ -745,7 +1011,6 @@ static int ssif_bmc_probe(struct i2c_client *client,
+ 	}
+ 
+ 	ssif_bmc->i2c_bus = i2c_get_adapdata(client->adapter);
+-
+ 	return 0;
+ }
+ 
+@@ -761,9 +1026,9 @@ static int ssif_bmc_remove(struct i2c_client *client)
+ 
+ static const struct of_device_id ssif_bmc_match[] = {
+ 	{ .compatible = "aspeed,ast2500-ssif-bmc" },
++	{ .compatible = "nuvoton,npcm7xx-ssif-bmc" },
+ 	{ },
+ };
+-
+ static const struct i2c_device_id ssif_bmc_id[] = {
+ 	{ DEVICE_NAME, 0 },
+ 	{ },
+-- 
+2.17.1
+
